@@ -16,7 +16,7 @@ static const u64 kDefaultShadowOffset64 = 1ULL << 44;
 
 uptr __asan_shadow_memory_dynamic_address = kDefaultShadowSentinel;
 uptr kHighMemEnd/*, kMidMemBeg, kMidMemEnd*/;
-
+uptr kPageSizeCached;
 
 #define SHADOW_SCALE kDefaultShadowScale
 #define SHADOW_OFFSET __asan_shadow_memory_dynamic_address
@@ -58,6 +58,18 @@ uptr RoundUpTo(uptr size, uptr boundary)
 	return (size + boundary - 1) & ~(boundary - 1);
 }
 
+uptr RoundDownTo(uptr x, uptr boundary) {
+	return x & ~(boundary - 1);
+}
+
+
+uptr GetPageSize() {
+	SYSTEM_INFO si;
+	GetSystemInfo(&si);
+	return si.dwPageSize;
+}
+
+
 uptr GetMmapGranularity() 
 {
 	SYSTEM_INFO si;
@@ -70,6 +82,13 @@ uptr GetMaxUserVirtualAddress() {
 	GetSystemInfo(&si);
 	return (uptr)si.lpMaximumApplicationAddress;
 }
+
+uptr GetPageSize();
+
+uptr GetPageSizeCached() {
+	return kPageSizeCached;
+}
+
 
 bool MemoryRangeIsAvailable(uptr range_start, uptr range_end) 
 {
@@ -222,6 +241,8 @@ static void ProtectGap(uptr addr, uptr size) {
 
 void InitializeShadowMemory() 
 {
+	kPageSizeCached = GetPageSize();
+
 	// Set the shadow memory address to uninitialized.
 	__asan_shadow_memory_dynamic_address = kDefaultShadowSentinel;
 
@@ -294,14 +315,32 @@ void InitializeShadowMemory()
 	}
 }
 
+static inline bool AddrIsInLowShadow(uptr a) { return a >= kLowShadowBeg && a <= kLowShadowEnd; }
+static inline bool AddrIsInHighShadow(uptr a) { return a >= kHighShadowBeg && a <= kHighMemEnd; }
+static inline bool AddrIsInShadow(uptr a) { return AddrIsInLowShadow(a) || AddrIsInHighShadow(a); }
+
+static inline uptr MemToShadow(uptr a) { return MEM_TO_SHADOW(a); }
+static inline uptr MemToShadow(void* a) { return MemToShadow((uptr)a); }
 
 
-
-
-LONG WINAPI ExceptionHandler(EXCEPTION_POINTERS* ExceptionInfo)
+LONG WINAPI ExceptionHandler(EXCEPTION_POINTERS* pExceptionInfo)
 {
-	std::cout << "Exception";
-	//return EXCEPTION_CONTINUE_SEARCH;
+	const EXCEPTION_RECORD& rec = *pExceptionInfo->ExceptionRecord;
+	if (rec.ExceptionCode != EXCEPTION_ACCESS_VIOLATION)
+		return EXCEPTION_CONTINUE_SEARCH;
+
+	const uptr op = rec.ExceptionInformation[0];
+	const uptr addr = (uptr)rec.ExceptionInformation[1];
+
+	if (!AddrIsInShadow(addr)) 
+		return EXCEPTION_CONTINUE_SEARCH;
+
+	uptr pageSize = GetPageSizeCached();
+	uptr page = RoundDownTo(addr, pageSize);
+
+	uptr result = (uptr)VirtualAlloc((LPVOID)page, pageSize, MEM_COMMIT, PAGE_READWRITE);
+	if (result != page)
+		return EXCEPTION_CONTINUE_SEARCH;
 	return EXCEPTION_CONTINUE_EXECUTION;
 }
 
@@ -315,9 +354,17 @@ int main()
 
 
 	//void* p = VirtualAlloc(nullptr, 4096, MEM_RESERVE, PAGE_READWRITE);
-	void* p = VirtualAlloc(nullptr, 4096, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+	void* p = VirtualAlloc(nullptr, 16, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
 	uint32_t* a = reinterpret_cast<uint32_t*>(p);
 	a[0] = 42;
+
+	MEMORY_BASIC_INFORMATION mbi;
+	VirtualQuery(p, &mbi, sizeof(mbi));
+
+
+	uptr sa = MemToShadow(p);
+	uint8_t* psa = reinterpret_cast<uint8_t*>(sa);
+	psa[0] = 5;
 
 	DWORD oldProtect = 0;
 	BOOL res = VirtualProtect(p, 4096, PAGE_READONLY, &oldProtect);
