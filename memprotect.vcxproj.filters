@@ -2,5 +2,14 @@
 <Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
   <ItemGroup>
     <ClCompile Include="memprotect.cpp" />
+    <ClCompile Include="X86DisassemblerDecoder.cpp" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="X86DisassemblerDecoder.h" />
+    <ClInclude Include="X86DisassemblerDecoderCommon.h" />
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="X86GenDisassemblerTables.inc" />
+    <None Include="X86GenInstrInfo.inc" />
   </ItemGroup>
 </Project>
