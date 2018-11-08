@@ -319,8 +319,8 @@ static inline bool AddrIsInLowShadow(uptr a) { return a >= kLowShadowBeg && a <=
 static inline bool AddrIsInHighShadow(uptr a) { return a >= kHighShadowBeg && a <= kHighMemEnd; }
 static inline bool AddrIsInShadow(uptr a) { return AddrIsInLowShadow(a) || AddrIsInHighShadow(a); }
 
-static inline uptr MemToShadow(uptr a) { return MEM_TO_SHADOW(a); }
-static inline uptr MemToShadow(void* a) { return MemToShadow((uptr)a); }
+static inline uint8_t* MemToShadow(uptr a) { return (uint8_t*)MEM_TO_SHADOW(a); }
+static inline uint8_t* MemToShadow(void* a) { return MemToShadow((uptr)a); }
 
 
 LONG WINAPI ExceptionHandler(EXCEPTION_POINTERS* pExceptionInfo)
@@ -329,20 +329,67 @@ LONG WINAPI ExceptionHandler(EXCEPTION_POINTERS* pExceptionInfo)
 	if (rec.ExceptionCode != EXCEPTION_ACCESS_VIOLATION)
 		return EXCEPTION_CONTINUE_SEARCH;
 
-	const uptr op = rec.ExceptionInformation[0];
 	const uptr addr = (uptr)rec.ExceptionInformation[1];
 
-	if (!AddrIsInShadow(addr)) 
-		return EXCEPTION_CONTINUE_SEARCH;
+	if (AddrIsInShadow(addr))
+	{
+		uptr pageSize = GetPageSizeCached();
+		uptr page = RoundDownTo(addr, pageSize);
 
-	uptr pageSize = GetPageSizeCached();
+		uptr result = (uptr)VirtualAlloc((LPVOID)page, pageSize, MEM_COMMIT, PAGE_READWRITE);
+		if (result != page)
+			return EXCEPTION_CONTINUE_SEARCH;
+		return EXCEPTION_CONTINUE_EXECUTION;
+	}
+
+	const uptr opWrite = 1;
+	const uptr op = rec.ExceptionInformation[0];
+	if (op == opWrite)
+	{
+		uint8_t* psa = MemToShadow(addr);
+		if (psa[0] > 0)
+		{
+			Report("Violation of address write protection %p, resetting protection\n", addr);
+			psa[0] = 0;
+		}
+		//pExceptionInfo->ContextRecord->
+
+		return EXCEPTION_CONTINUE_EXECUTION;
+	}
+
+	return EXCEPTION_CONTINUE_SEARCH;
+}
+
+
+void ProtectAddress(void* p)
+{
+	uptr addr = (uptr)p;
+	uint8_t* psa = MemToShadow(p);
+	if (psa[0] > 0)   // may trigger shadow memory allocation
+		return; // already protected
+
+	const uptr pageSize = GetPageSizeCached();
 	uptr page = RoundDownTo(addr, pageSize);
 
-	uptr result = (uptr)VirtualAlloc((LPVOID)page, pageSize, MEM_COMMIT, PAGE_READWRITE);
-	if (result != page)
-		return EXCEPTION_CONTINUE_SEARCH;
-	return EXCEPTION_CONTINUE_EXECUTION;
+	DWORD oldProtect = 0;
+	BOOL res = VirtualProtect((void*)page, pageSize, PAGE_READONLY, &oldProtect);
+	if (res != 0)
+	{
+		psa[0] = 1;
+	}
 }
+
+void UnprotectAddress(void* p)
+{
+	uint8_t* psa = MemToShadow(p);
+	if (psa[0] == 0)   // may trigger shadow memory allocation
+		return; // already un-protected
+
+	psa[0] = 0;
+
+	// todo: unprotect page
+}
+
 
 int main()
 {
@@ -351,28 +398,49 @@ int main()
 
 	AddVectoredExceptionHandler(TRUE, ExceptionHandler);
 
-
-
 	//void* p = VirtualAlloc(nullptr, 4096, MEM_RESERVE, PAGE_READWRITE);
 	void* p = VirtualAlloc(nullptr, 16, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
-	uint32_t* a = reinterpret_cast<uint32_t*>(p);
+	uint64_t* a = reinterpret_cast<uint64_t*>(p);
 	a[0] = 42;
 
 	MEMORY_BASIC_INFORMATION mbi;
 	VirtualQuery(p, &mbi, sizeof(mbi));
 
 
-	uptr sa = MemToShadow(p);
-	uint8_t* psa = reinterpret_cast<uint8_t*>(sa);
-	psa[0] = 5;
+	//uint8_t* psa = MemToShadow(p);
+	//psa[0] = 5;
 
-	DWORD oldProtect = 0;
-	BOOL res = VirtualProtect(p, 4096, PAGE_READONLY, &oldProtect);
+	//DWORD oldProtect = 0;
+	//BOOL res = VirtualProtect(p, 4096, PAGE_READONLY, &oldProtect);
 
-	uint32_t x = a[0];
-	a[1] = 29;
+	//uint32_t x = a[0];
+	//a[1] = 29;
 
+	a[0] = 0;
+	a[1] = 1;
+	a[2] = 2;
+	a[3] = 3;
+	a[4] = 4;
 
+	ProtectAddress(&a[3]);
+
+	a[0] = 10;
+	a[1] = 11;
+	a[2] = 12;
+	a[3] = 13;
+	a[4] = 14;
+
+	ProtectAddress(&a[3]);
+
+	a[0] = 20;
+	a[1] = 21;
+	a[2] = 22;
+	//a[3] = 23;
+	a[4] = 24;
+
+	UnprotectAddress(&a[3]);
+
+	a[3] = 23;
 
     std::cout << "Hello World!\n"; 
 }
