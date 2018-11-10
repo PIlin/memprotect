@@ -484,7 +484,95 @@ void PrepareTrampoline(PCONTEXT pContext, uptr page, uptr pageSize)
 }
 
 
-LONG WINAPI ExceptionHandler(EXCEPTION_POINTERS* pExceptionInfo)
+struct SGuardProcessingState
+{
+	enum class EState { None, TemporaryUnprotected };
+	EState state = EState::None;
+	void* page = nullptr;
+};
+
+static thread_local SGuardProcessingState guardProcessingState;
+
+LONG WINAPI ExceptionHandlerWithStep(EXCEPTION_POINTERS* pExceptionInfo)
+{
+	const EXCEPTION_RECORD& rec = *pExceptionInfo->ExceptionRecord;
+	if (rec.ExceptionCode == EXCEPTION_ACCESS_VIOLATION)
+	{
+		const uptr addr = (uptr)rec.ExceptionInformation[1];
+
+		if (AddrIsInShadow(addr))
+		{
+			uptr pageSize = GetPageSizeCached();
+			uptr page = RoundDownTo(addr, pageSize);
+
+			uptr result = (uptr)VirtualAlloc((LPVOID)page, pageSize, MEM_COMMIT, PAGE_READWRITE);
+			if (result != page)
+				return EXCEPTION_CONTINUE_SEARCH;
+			return EXCEPTION_CONTINUE_EXECUTION;
+		}
+
+		const uptr opWrite = 1;
+		const uptr op = rec.ExceptionInformation[0];
+		if (op == opWrite)
+		{
+			auto& state = guardProcessingState;
+			if (state.state != SGuardProcessingState::EState::None)
+			{
+				Report("Wrong state to process access violation\n");
+				::abort();
+			}
+
+			uint8_t* psa = MemToShadow(addr);
+			if (psa[0] > 0)
+			{
+				Report("Violation of address write protection %p, resetting protection\n", addr);
+				psa[0] = 0;
+			}
+
+			const uptr pageSize = GetPageSizeCached();
+			const uptr page = RoundDownTo(addr, pageSize);
+
+			DWORD oldProtect = 0;
+			const BOOL res = VirtualProtect((void*)page, pageSize, PAGE_READWRITE, &oldProtect);
+			if (res == 0)
+			{
+				Report("Unable to remove protection from page %p for address %p: err %d\n", page, addr, GetLastError());
+				::abort();
+			}
+
+			pExceptionInfo->ContextRecord->EFlags |= 0x100;
+			state.state = SGuardProcessingState::EState::TemporaryUnprotected;
+			state.page = (void*)page;
+			return EXCEPTION_CONTINUE_EXECUTION;
+		}
+	}
+	else if (rec.ExceptionCode == EXCEPTION_SINGLE_STEP)
+	{
+		auto& state = guardProcessingState;
+		if (state.state == SGuardProcessingState::EState::TemporaryUnprotected)
+		{
+			void* page = state.page;
+
+			state.state = SGuardProcessingState::EState::None;
+			state.page = nullptr;
+
+			
+			const uptr pageSize = GetPageSizeCached();
+			DWORD oldProtect = 0;
+			const BOOL res = VirtualProtect(page, pageSize, PAGE_READONLY, &oldProtect);
+			if (res == 0)
+			{
+				Report("Unable to set protection back to page %p\n", page);
+				::abort();
+			}
+			return EXCEPTION_CONTINUE_EXECUTION;
+		}
+	}
+
+	return EXCEPTION_CONTINUE_SEARCH;
+}
+
+LONG WINAPI ExceptionHandlerWithTrampoline(EXCEPTION_POINTERS* pExceptionInfo)
 {
 	const EXCEPTION_RECORD& rec = *pExceptionInfo->ExceptionRecord;
 	if (rec.ExceptionCode != EXCEPTION_ACCESS_VIOLATION && rec.ExceptionCode != EXCEPTION_GUARD_PAGE)
@@ -539,7 +627,8 @@ void __declspec(noinline)  ProtectAddress(void* p)
 
 	DWORD oldProtect = 0;
 	//RestoreGuard((void*)page);
-	BOOL res = VirtualProtect((void*)page, pageSize, PAGE_READWRITE | PAGE_GUARD, &oldProtect);
+	//BOOL res = VirtualProtect((void*)page, pageSize, PAGE_READWRITE | PAGE_GUARD, &oldProtect);
+	BOOL res = VirtualProtect((void*)page, pageSize, PAGE_READONLY, &oldProtect);
 	if (res != 0)
 	{
 		psa[0] = 1;
@@ -564,7 +653,8 @@ int main()
 	InitializeShadowMemory();
 	InitTrampoline();
 
-	AddVectoredExceptionHandler(TRUE, ExceptionHandler);
+	//AddVectoredExceptionHandler(TRUE, ExceptionHandlerWithTrampoline);
+	AddVectoredExceptionHandler(TRUE, ExceptionHandlerWithStep);
 
 	//void* p = VirtualAlloc(nullptr, 4096, MEM_RESERVE, PAGE_READWRITE);
 	void* p = VirtualAlloc(nullptr, 16, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
