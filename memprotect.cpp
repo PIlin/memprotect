@@ -327,20 +327,6 @@ static inline uint8_t* MemToShadow(uptr a) { return (uint8_t*)MEM_TO_SHADOW(a); 
 static inline uint8_t* MemToShadow(void* a) { return MemToShadow((uptr)a); }
 
 
-static int reader(const struct reader_info* info, uint8_t* byte, uint64_t address) 
-{
-	if (address - info->offset >= info->size)
-		// out of buffer range
-		return -1;
-
-	*byte = info->code[address - info->offset];
-
-	return 0;
-};
-
-
-static void* s_trampolinePage = nullptr;
-
 
 
 static __declspec(noinline) void RestoreGuard(void* addr)
@@ -356,133 +342,6 @@ static __declspec(noinline) void VirtualProtectWrapper(void* addr, uptr pageSize
 	if (!res)
 		Report("Can't restore protection");
 }
-
-void InitTrampoline()
-{
-	void* p = &VirtualProtectWrapper;
-
-	uptr granularity = GetMmapGranularity();
-	uptr alignment = 8 * granularity;
-
-	uptr pageAddr = (uptr)p;
-	do {
-		pageAddr = FindAvailableMemoryRange(4096, granularity, 0, pageAddr);
-		s_trampolinePage = VirtualAlloc((void*)pageAddr, 4096, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE);
-		if (s_trampolinePage == nullptr)
-		{
-			Report("Unable to commit trampoline page %d\n", GetLastError());
-		}
-	} while (pageAddr != (uptr)s_trampolinePage);
-}
-
-#define W(x) *out++ = x
-static u8* Write(u8* out, u8 a) { W(a); return out; }
-static u8* Write(u8* out, u8 a, u8 b) { W(a); W(b); return out; }
-static u8* Write(u8* out, u8 a, u8 b, u8 c) { W(a); W(b); W(c); return out; }
-static u8* Write(u8* out, u8 a, u8 b, u8 c, u8 d) { W(a); W(b); W(c); W(d); return out; }
-static u8* Write(u8* out, u8 a, u8 b, u8 c, u8 d, u8 e) { W(a); W(b); W(c); W(d); W(e); return out; }
-static u8* Write(u8* out, u8 a, u8 b, u8 c, u8 d, u8 e, u8 f) { W(a); W(b); W(c); W(d); W(e); W(f); return out; }
-#undef W
-static u8* WriteU64(u8* out, u64 val)
-{
-	::memcpy(out, &val, 8);
-	return out + 8;
-}
-static u8* WriteU32(u8* out, u32 val)
-{
-	::memcpy(out, &val, 4);
-	return out + 4;
-}
-static u8* WriteMovAbsR8(u8* out, u64 val) { return WriteU64(Write(out, 0x49, 0xb8), val); }
-static u8* WriteMovAbsR9(u8* out, u64 val) { return WriteU64(Write(out, 0x49, 0xb9), val); }
-static u8* WriteMovAbsRAX(u8* out, u64 val) { return WriteU64(Write(out, 0x48, 0xb8), val); }
-static u8* WriteMovAbsRCX(u8* out, u64 val) { return WriteU64(Write(out, 0x48, 0xb9), val); }
-static u8* WriteMovAbsRDX(u8* out, u64 val) { return WriteU64(Write(out, 0x48, 0xba), val); }
-
-static u8* WriteMovR8D(u8* out, u32 val) { return WriteU32(Write(out, 0x41, 0xb8), val); }
-
-static u8* WritePushRAX(u8* out) { return Write(out, 0x50); }
-static u8* WritePushRCX(u8* out) { return Write(out, 0x51); }
-static u8* WritePushRDX(u8* out) { return Write(out, 0x52); }
-static u8* WritePushR8(u8* out) { return Write(out, 0x41, 0x50); }
-static u8* WritePushR9(u8* out) { return Write(out, 0x41, 0x51); }
-
-static u8* WritePopRAX(u8* out) { return Write(out, 0x58); }
-static u8* WritePopRCX(u8* out) { return Write(out, 0x59); }
-static u8* WritePopRDX(u8* out) { return Write(out, 0x5a); }
-static u8* WritePopR8(u8* out) { return Write(out, 0x41, 0x58); }
-static u8* WritePopR9(u8* out) { return Write(out, 0x41, 0x59); }
-
-static u8* WriteXorR9D(u8* out) { return Write(out, 0x45, 0x31, 0xc9); }
-
-template <size_t N>
-u8* CopyN(const u8 arr[N], u8* out)
-{
-	return std::copy(arr, arr + N, out);
-}
-
-u8* Copy(const u8* arr, size_t n, u8* out)
-{
-	return std::copy(arr, arr + n, out);
-}
-
-void PrepareTrampoline(PCONTEXT pContext, uptr page, uptr pageSize)
-{
-	InternalInstruction instruction = {};
-	reader_info info;
-	u8* pRip = (u8*)pContext->Rip;
-	info.code = pRip;
-	info.size = 16;
-	info.offset = 0;
-
-	if (decodeInstruction(&instruction, reader, &info, 0, MODE_64BIT))
-	{
-		Report("Can't decode intstruction");
-		::abort();
-	}
-	const size_t instLen = instruction.length;
-
-	u8* p = (u8*)s_trampolinePage;
-
-	p = Copy(pRip, instLen, p); // original op
-	
-	p = WritePushRDX(p);
-	p = WritePushR9(p);
-	p = WritePushR8(p);
-	p = WritePushRCX(p);
-	p = WritePushRAX(p);
-
-	p = WriteMovAbsRCX(p, page);
-	p = WriteMovAbsRDX(p, pageSize);
-	//p = WriteMovR8D(p, PAGE_READWRITE | PAGE_GUARD);
-	//p = WriteXorR9D(p);
-
-	void* vp = &VirtualProtectWrapper;
-	int64_t jump = (uptr)vp - ((uptr)p + 5);
-	if (abs(jump) < 0x100000000)
-	{
-		p = Write(p, 0xE8); // call
-		p = WriteU32(p, (u32)(int32_t)jump);
-	}
-	else
-	{
-		Report("can't construct jump");
-		::abort();
-	}
-	
-	p = WritePopRAX(p);
-	p = WritePopRCX(p);
-	p = WritePopR8(p);
-	p = WritePopR9(p);
-	p = WritePopRDX(p);
-
-	p = Write(p, 0xff, 0x25, 0x0, 0, 0, 0); // jmp    QWORD PTR [rip+0x0]  
-	p = WriteU64(p, (u64)(pRip + instLen));
-	p = WriteU64(p, 0x9090909090909090); // nop
-
-	pContext->Rip = (uptr)s_trampolinePage;
-}
-
 
 struct SGuardProcessingState
 {
@@ -572,49 +431,6 @@ LONG WINAPI ExceptionHandlerWithStep(EXCEPTION_POINTERS* pExceptionInfo)
 	return EXCEPTION_CONTINUE_SEARCH;
 }
 
-LONG WINAPI ExceptionHandlerWithTrampoline(EXCEPTION_POINTERS* pExceptionInfo)
-{
-	const EXCEPTION_RECORD& rec = *pExceptionInfo->ExceptionRecord;
-	if (rec.ExceptionCode != EXCEPTION_ACCESS_VIOLATION && rec.ExceptionCode != EXCEPTION_GUARD_PAGE)
-		return EXCEPTION_CONTINUE_SEARCH;
-
-	const uptr addr = (uptr)rec.ExceptionInformation[1];
-
-	if (rec.ExceptionCode == EXCEPTION_ACCESS_VIOLATION)
-	{
-		if (AddrIsInShadow(addr))
-		{
-			uptr pageSize = GetPageSizeCached();
-			uptr page = RoundDownTo(addr, pageSize);
-
-			uptr result = (uptr)VirtualAlloc((LPVOID)page, pageSize, MEM_COMMIT, PAGE_READWRITE);
-			if (result != page)
-				return EXCEPTION_CONTINUE_SEARCH;
-			return EXCEPTION_CONTINUE_EXECUTION;
-		}
-	}
-
-	const uptr opWrite = 1;
-	const uptr op = rec.ExceptionInformation[0];
-	if (op == opWrite)
-	{
-		uint8_t* psa = MemToShadow(addr);
-		if (psa[0] > 0)
-		{
-			Report("Violation of address write protection %p, resetting protection\n", addr);
-			psa[0] = 0;
-		}
-
-		uptr pageSize = GetPageSizeCached();
-		uptr page = RoundDownTo(addr, pageSize);
-		PrepareTrampoline(pExceptionInfo->ContextRecord, page, pageSize);
-		return EXCEPTION_CONTINUE_EXECUTION;
-	}
-
-	return EXCEPTION_CONTINUE_SEARCH;
-}
-
-
 void __declspec(noinline)  ProtectAddress(void* p)
 {
 	uptr addr = (uptr)p;
@@ -651,9 +467,7 @@ int main()
 {
 	InitializeHighMemEnd();
 	InitializeShadowMemory();
-	InitTrampoline();
 
-	//AddVectoredExceptionHandler(TRUE, ExceptionHandlerWithTrampoline);
 	AddVectoredExceptionHandler(TRUE, ExceptionHandlerWithStep);
 
 	//void* p = VirtualAlloc(nullptr, 4096, MEM_RESERVE, PAGE_READWRITE);
