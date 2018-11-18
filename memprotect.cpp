@@ -15,6 +15,7 @@
 using uptr = uintptr_t;
 using u64 = uint64_t;
 using u32 = uint32_t;
+using u16 = uint16_t;
 using u8 = uint8_t;
 
 
@@ -72,6 +73,17 @@ uptr RoundUpTo(uptr size, uptr boundary)
 uptr RoundDownTo(uptr x, uptr boundary) {
 	return x & ~(boundary - 1);
 }
+
+using TPageInfo = u16;
+static const u64 kPageInfoRecordSize = sizeof(TPageInfo);
+uptr kPageInfoScale = kDefaultShadowSentinel;
+uptr __asan_page_info_memory_dynamic_address = kDefaultShadowSentinel;
+#define PAGEINFO_OFFSET __asan_page_info_memory_dynamic_address
+#define PAGEADDR_TO_PAGEINFO(mem) (((mem) / kPageInfoScale) + (PAGEINFO_OFFSET))
+#define MEM_TO_PAGEINFO(mem) PAGEADDR_TO_PAGEINFO(RoundDownTo((mem), kPageSizeCached))
+
+#define kPageInfoBeg  PAGEINFO_OFFSET
+#define kPageInfoEnd  (MEM_TO_PAGEINFO(kHighMemEnd) + (kPageInfoRecordSize - 1))
 
 
 uptr GetPageSize() {
@@ -184,8 +196,6 @@ static void InitializeHighMemEnd() {
 	// Increase kHighMemEnd to make sure it's properly
 	// aligned together with kHighMemBeg:
 	kHighMemEnd |= SHADOW_GRANULARITY * GetMmapGranularity() - 1;
-
-
 }
 
 void* MmapFixedNoAccess(uptr fixed_addr, uptr size, const char *name) {
@@ -337,12 +347,71 @@ void InitializeShadowMemory()
 	}
 }
 
+uptr FindDynamicPageInfoStart()
+{
+	uptr granularity = GetMmapGranularity();
+	uptr alignment = 8 * granularity;
+	uptr left_padding = granularity;
+	uptr end = kPageInfoEnd;
+	uptr space_size = end + left_padding;
+	uptr pageinfo_start = FindAvailableMemoryRange(space_size, alignment, granularity);
+	return pageinfo_start;
+}
+
+void PrintAddressSpacePageInfoLayout() {
+	::printf("|| `[%p, %p]` || PageInfo   ||\n",
+		(void*)kPageInfoBeg, (void*)kPageInfoEnd);
+}
+
+
+void InitializePageInfoMemory()
+{
+	kPageInfoScale = GetPageSizeCached() / kPageInfoRecordSize;
+
+
+	__asan_page_info_memory_dynamic_address = 0;
+	uptr pageinfo_start = FindDynamicPageInfoStart();
+	__asan_page_info_memory_dynamic_address = pageinfo_start;
+
+	bool fullRangeIsAvailable = false;
+	if (!fullRangeIsAvailable)
+		fullRangeIsAvailable =
+		MemoryRangeIsAvailable(pageinfo_start, kPageInfoEnd);
+
+	PrintAddressSpacePageInfoLayout();
+
+	assert(pageinfo_start == kPageInfoBeg);
+
+	if (fullRangeIsAvailable) 
+	{
+		ReserveShadowMemoryRange(pageinfo_start, kPageInfoEnd, "page info");
+	}
+	else 
+	{
+		Report(
+			"Page info mapping interleaves with an existing memory mapping. "
+			"ASan cannot proceed correctly. ABORTING.\n");
+		Report("ASan page info was supposed to be located in the [%p-%p] range.\n",
+			pageinfo_start, kPageInfoEnd);
+		::abort();
+	}
+}
+
+
 static inline bool AddrIsInLowShadow(uptr a) { return a >= kLowShadowBeg && a <= kLowShadowEnd; }
 static inline bool AddrIsInHighShadow(uptr a) { return a >= kHighShadowBeg && a <= kHighMemEnd; }
 static inline bool AddrIsInShadow(uptr a) { return AddrIsInLowShadow(a) || AddrIsInHighShadow(a); }
 
+static inline bool AddrIsInPageInfo(uptr a) { return kPageInfoBeg <= a && a <= kPageInfoEnd; }
+
 static inline u8* MemToShadow(uptr a) { return (u8*)MEM_TO_SHADOW(a); }
 static inline u8* MemToShadow(void* a) { return MemToShadow((uptr)a); }
+
+static inline TPageInfo* MemToPageInfo(uptr a) { return (TPageInfo*)MEM_TO_PAGEINFO(a); }
+static inline TPageInfo* MemToPageInfo(void* a) { return MemToPageInfo((uptr)a); }
+
+static inline TPageInfo* PageToPageInfo(uptr a) { return (TPageInfo*)PAGEADDR_TO_PAGEINFO(a); }
+static inline TPageInfo* PageToPageInfo(void* a) { return PageToPageInfo((uptr)a); }
 
 
 static inline u8 AddrToShadowBitIndex(uptr addr)
@@ -376,7 +445,7 @@ LONG WINAPI ExceptionHandlerWithStep(EXCEPTION_POINTERS* pExceptionInfo)
 	{
 		const uptr addr = (uptr)rec.ExceptionInformation[1];
 
-		if (AddrIsInShadow(addr))
+		if (AddrIsInShadow(addr) || AddrIsInPageInfo(addr))
 		{
 			uptr pageSize = GetPageSizeCached();
 			uptr page = RoundDownTo(addr, pageSize);
@@ -402,15 +471,16 @@ LONG WINAPI ExceptionHandlerWithStep(EXCEPTION_POINTERS* pExceptionInfo)
 			uint8_t* psa = MemToShadow(addr);
 			if (IsMemProtected(psa[0], bitMask))
 			{
-				Report("Violation of address write protection %p, resetting protection\n", addr);
-				//psa[0] = ResetMemProtected(psa[0], bitMask);
+				Report("Violation of address write protection %p, ecxeption addr %p\n", addr, rec.ExceptionAddress);
 			}
 
 			const uptr pageSize = GetPageSizeCached();
 			const uptr page = RoundDownTo(addr, pageSize);
 
 			DWORD oldProtect = 0;
+			//::printf("-- temp remove protect on page %p\n", (void*)page);
 			const BOOL res = VirtualProtect((void*)page, pageSize, PAGE_READWRITE, &oldProtect);
+			assert(oldProtect == PAGE_READONLY);
 			if (res == 0)
 			{
 				Report("Unable to remove protection from page %p for address %p: err %d\n", page, addr, GetLastError());
@@ -436,7 +506,9 @@ LONG WINAPI ExceptionHandlerWithStep(EXCEPTION_POINTERS* pExceptionInfo)
 			
 			const uptr pageSize = GetPageSizeCached();
 			DWORD oldProtect = 0;
+			//::printf("-- restore protect on page %p\n", (void*)page);
 			const BOOL res = VirtualProtect(page, pageSize, PAGE_READONLY, &oldProtect);
+			assert(oldProtect == PAGE_READWRITE);
 			if (res == 0)
 			{
 				Report("Unable to set protection back to page %p\n", page);
@@ -465,41 +537,69 @@ void __declspec(noinline)  ProtectAddress(void* p)
 	const uptr pageSize = GetPageSizeCached();
 	const uptr page = RoundDownTo(addr, pageSize);
 
-	DWORD oldProtect = 0;
-	BOOL res = VirtualProtect((void*)page, pageSize, PAGE_READONLY, &oldProtect);
-	if (res != 0)
+	TPageInfo* pPageInfo = PageToPageInfo(page);
+	bool isPageProtected = (*pPageInfo != 0);
+	if (!isPageProtected)
+	{
+		DWORD oldProtect = 0;
+		BOOL res = VirtualProtect((void*)page, pageSize, PAGE_READONLY, &oldProtect);
+		if (res != 0)
+		{
+			isPageProtected = true;
+		}
+	}
+	if (isPageProtected)
 	{
 		psa[0] = SetMemProtected(psa[0], bitMask);
+		*pPageInfo += 1;
 	}
 }
 
 void __declspec(noinline)  UnprotectAddress(void* p)
 {
+	uptr addr = (uptr)p;
+
 	const u8 bitMask = AddrToShadowBitMask(p);
 	uint8_t* psa = MemToShadow(p);
 	if (!IsMemProtected(psa[0], bitMask))   // may trigger shadow memory allocation
 		return; // already un-protected
 
-	psa[0] = ResetMemProtected(psa[0], bitMask);
+	const uptr pageSize = GetPageSizeCached();
+	const uptr page = RoundDownTo(addr, pageSize);
+	TPageInfo* pPageInfo = PageToPageInfo(page);
+	bool isPageProtected = (*pPageInfo != 0);
+	if (!isPageProtected)
+	{
+		Report("PageInfo and shadow info are out of sync");
+		::abort();
+	}
 
-	// todo: unprotect page
+	psa[0] = ResetMemProtected(psa[0], bitMask);
+	*pPageInfo -= 1;
+
+	if (*pPageInfo == 0)
+	{
+		DWORD oldProtect = 0;
+		BOOL res = VirtualProtect((void*)page, pageSize, PAGE_READWRITE, &oldProtect);
+		assert(oldProtect == PAGE_READONLY);
+		if (res == 0)
+		{
+			Report("Unable to remove page protection %d", GetLastError()); 
+		}
+	}
 }
 
 
-int main()
+void Tests()
 {
-	InitializeHighMemEnd();
-	InitializeShadowMemory();
-
-	AddVectoredExceptionHandler(TRUE, ExceptionHandlerWithStep);
-
-	//void* p = VirtualAlloc(nullptr, 4096, MEM_RESERVE, PAGE_READWRITE);
-	void* p = VirtualAlloc(nullptr, 16, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
-	auto* a = reinterpret_cast<uint32_t*>(p);
-	a[0] = 42;
-
-	MEMORY_BASIC_INFORMATION mbi;
-	VirtualQuery(p, &mbi, sizeof(mbi));
+	if (GetPageSizeCached() == 4096)
+	{
+		assert(MemToPageInfo(0ull) == (TPageInfo*)kPageInfoBeg + 0);
+		assert(MemToPageInfo(56) == (TPageInfo*)kPageInfoBeg + 0);
+		assert(MemToPageInfo(4095) == (TPageInfo*)kPageInfoBeg + 0);
+		assert(MemToPageInfo(4097) == (TPageInfo*)kPageInfoBeg + 1);
+		assert(MemToPageInfo(0x7FFFFFFFFFFF) == (TPageInfo*)(kPageInfoEnd - 1));
+	}
 
 	if (kMemBytesInShadowBitScale == 3)
 	{
@@ -519,6 +619,30 @@ int main()
 		assert(AddrToShadowBitIndex(31) == 7);
 		assert(AddrToShadowBitIndex(32) == 0);
 	}
+}
+
+
+int main()
+{
+	InitializeHighMemEnd();
+	InitializeShadowMemory();
+	InitializePageInfoMemory();
+
+	Tests();
+
+	AddVectoredExceptionHandler(TRUE, ExceptionHandlerWithStep);
+
+	//void* p = VirtualAlloc(nullptr, 4096, MEM_RESERVE, PAGE_READWRITE);
+	void* p = VirtualAlloc(nullptr, 16, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+	auto* a = reinterpret_cast<uint32_t*>(p);
+	a[0] = 42;
+
+	MEMORY_BASIC_INFORMATION mbi;
+	VirtualQuery(p, &mbi, sizeof(mbi));
+
+	
+	
+	
 
 	//uint8_t* psa = MemToShadow(p);
 	//psa[0] = 5;
@@ -535,6 +659,7 @@ int main()
 	}
 
 
+	::printf("------------ stage 0\n");
 	a[0] = 0;
 	a[1] = 1;
 	a[2] = 2;
@@ -543,6 +668,7 @@ int main()
 
 	ProtectAddress(&a[3]);
 
+	::printf("------------ stage 1\n");
 	a[0] = 10;
 	a[1] = 11;
 	a[2] = 12;
@@ -551,15 +677,31 @@ int main()
 
 	ProtectAddress(&a[1]);
 
+	::printf("------------ stage 2\n");
 	a[0] = 20;
 	a[1] = 21;
 	a[2] = 22;
-	//a[3] = 23;
+	a[3] = 23;
 	a[4] = 24;
 
-	//UnprotectAddress(&a[3]);
+	
+	UnprotectAddress(&a[3]);
 
-	a[3] = 23;
+	::printf("------------ stage 3\n");
+	a[0] = 30;
+	a[1] = 31;
+	a[2] = 32;
+	a[3] = 33;
+	a[4] = 34;
+
+	UnprotectAddress(&a[1]);
+
+	::printf("------------ stage 4\n");
+	a[0] = 40;
+	a[1] = 41;
+	a[2] = 42;
+	a[3] = 43;
+	a[4] = 44;
 
     std::cout << "Hello World!\n"; 
 }
