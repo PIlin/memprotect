@@ -1,9 +1,16 @@
-
+#include <cassert>
 #include <iostream>
 
 #define NOMINMAX
 #define WIN32_LEAN_AND_MEAN
 #include <Windows.h>
+
+
+#if 0
+#define NODISCARD [[nodiscard]]
+#else
+#define NODISCARD
+#endif
 
 using uptr = uintptr_t;
 using u64 = uint64_t;
@@ -11,14 +18,15 @@ using u32 = uint32_t;
 using u8 = uint8_t;
 
 
-
-static const u64 kDefaultShadowScale = 3;
+static const u64 kMemBytesInShadowBitScale = 2; // 2^3=8 bytes, 2^2=4 bytes
+static const u64 kDefaultShadowScale = 3 + kMemBytesInShadowBitScale;
 static const u64 kDefaultShadowSentinel = ~(uptr)0;
 static const u64 kDefaultShadowOffset64 = 1ULL << 44;
 
 
 uptr __asan_shadow_memory_dynamic_address = kDefaultShadowSentinel;
-uptr kHighMemEnd/*, kMidMemBeg, kMidMemEnd*/;
+uptr kHighMemBeg, kHighMemEnd/*, kMidMemBeg, kMidMemEnd*/;
+uptr kProtectedShadowGapBeg, kProtectedShadowGapSize;
 uptr kPageSizeCached;
 
 #define SHADOW_SCALE kDefaultShadowScale
@@ -30,7 +38,7 @@ uptr kPageSizeCached;
 #define kLowMemBeg      0
 #define kLowMemEnd      (SHADOW_OFFSET ? SHADOW_OFFSET - 1 : 0)
 
-#define kHighMemBeg     (MEM_TO_SHADOW(kHighMemEnd) + 1)
+//#define kHighMemBeg     (MEM_TO_SHADOW(kHighMemEnd) + 1)
 
 #define kLowShadowBeg   SHADOW_OFFSET
 #define kLowShadowEnd   MEM_TO_SHADOW(kLowMemEnd)
@@ -146,6 +154,8 @@ void PrintAddressSpaceLayout() {
 	//}
 	::printf("|| `[%p, %p]` || ShadowGap  ||\n",
 		(void*)kShadowGapBeg, (void*)kShadowGapEnd);
+	::printf("|| `[%p, %p]` || ShadowGapPr||\n",
+		(void*)kProtectedShadowGapBeg, (void*)(kProtectedShadowGapBeg + kProtectedShadowGapSize - 1));
 	if (kLowShadowBeg) {
 		::printf("|| `[%p, %p]` || LowShadow  ||\n",
 			(void*)kLowShadowBeg, (void*)kLowShadowEnd);
@@ -166,6 +176,7 @@ void PrintAddressSpaceLayout() {
 	::printf("SHADOW_SCALE: %d\n", (int)SHADOW_SCALE);
 	::printf("SHADOW_GRANULARITY: %d\n", (int)SHADOW_GRANULARITY);
 	::printf("SHADOW_OFFSET: 0x%zx\n", (uptr)SHADOW_OFFSET);
+	::printf("page size: %zd\n", GetPageSizeCached());
 }
 
 static void InitializeHighMemEnd() {
@@ -173,6 +184,8 @@ static void InitializeHighMemEnd() {
 	// Increase kHighMemEnd to make sure it's properly
 	// aligned together with kHighMemBeg:
 	kHighMemEnd |= SHADOW_GRANULARITY * GetMmapGranularity() - 1;
+
+
 }
 
 void* MmapFixedNoAccess(uptr fixed_addr, uptr size, const char *name) {
@@ -263,11 +276,19 @@ void InitializeShadowMemory()
 	// Update the shadow memory address (potentially) used by instrumentation.
 	__asan_shadow_memory_dynamic_address = shadow_start;
 
-	if (kLowShadowBeg) shadow_start -= GetMmapGranularity();
+	const uptr mmapGranularity = GetMmapGranularity();
+
+	if (kLowShadowBeg) shadow_start -= mmapGranularity;
+
+	kHighMemBeg = (MEM_TO_SHADOW(kHighMemEnd) + 1) + mmapGranularity;
+	kHighMemBeg &= ~(mmapGranularity * SHADOW_GRANULARITY - 1);
 
 	if (!full_shadow_is_available)
 		full_shadow_is_available =
 		MemoryRangeIsAvailable(shadow_start, kHighShadowEnd);
+
+	kProtectedShadowGapBeg = RoundUpTo(kShadowGapBeg, mmapGranularity);
+	kProtectedShadowGapSize = RoundDownTo(kShadowGapEnd - kShadowGapBeg + 1, mmapGranularity);
 
 //#if SANITIZER_LINUX && defined(__x86_64__) && defined(_LP64) && \
 //    !ASAN_FIXED_MAPPING
@@ -286,8 +307,7 @@ void InitializeShadowMemory()
 		// mmap the high shadow.
 		ReserveShadowMemoryRange(kHighShadowBeg, kHighShadowEnd, "high shadow");
 		// protect the gap.
-		ProtectGap(kShadowGapBeg, kShadowGapEnd - kShadowGapBeg + 1);
-		//CHECK_EQ(kShadowGapEnd, kHighShadowBeg - 1);
+		ProtectGap(kProtectedShadowGapBeg, kProtectedShadowGapSize);
 	}
 	//else if (kMidMemBeg &&
 	//	MemoryRangeIsAvailable(shadow_start, kMidMemBeg - 1) &&
@@ -321,25 +341,24 @@ static inline bool AddrIsInLowShadow(uptr a) { return a >= kLowShadowBeg && a <=
 static inline bool AddrIsInHighShadow(uptr a) { return a >= kHighShadowBeg && a <= kHighMemEnd; }
 static inline bool AddrIsInShadow(uptr a) { return AddrIsInLowShadow(a) || AddrIsInHighShadow(a); }
 
-static inline uint8_t* MemToShadow(uptr a) { return (uint8_t*)MEM_TO_SHADOW(a); }
-static inline uint8_t* MemToShadow(void* a) { return MemToShadow((uptr)a); }
+static inline u8* MemToShadow(uptr a) { return (u8*)MEM_TO_SHADOW(a); }
+static inline u8* MemToShadow(void* a) { return MemToShadow((uptr)a); }
 
 
-
-
-static __declspec(noinline) void RestoreGuard(void* addr)
+static inline u8 AddrToShadowBitIndex(uptr addr)
 {
-	const uptr pageSize = GetPageSizeCached();
-	VirtualProtect(addr, pageSize, PAGE_READWRITE | PAGE_GUARD, nullptr);
+	addr >>= kMemBytesInShadowBitScale;
+	uptr mask = ((1ull << 3) - 1ull);
+	return u8(addr & mask);
 }
 
-static __declspec(noinline) void VirtualProtectWrapper(void* addr, uptr pageSize)
-{
-	DWORD oldProtect = 0;
-	BOOL res = VirtualProtect(addr, pageSize, PAGE_READWRITE | PAGE_GUARD, &oldProtect);
-	if (!res)
-		Report("Can't restore protection");
-}
+static inline u8 AddrToShadowBitMask(uptr addr) { return 1 << AddrToShadowBitIndex(addr); }
+static inline u8 AddrToShadowBitMask(void* addr) { return AddrToShadowBitMask((uptr)addr); }
+
+static inline bool IsMemProtected(u8 shadowByte, u8 bitMask) { return (shadowByte & bitMask) != 0; }
+NODISCARD static inline u8 SetMemProtected(u8 shadowByte, u8 bitMask) { return (shadowByte | bitMask); }
+NODISCARD static inline u8 ResetMemProtected(u8 shadowByte, u8 bitMask){ return (shadowByte & (~bitMask)); }
+
 
 struct SGuardProcessingState
 {
@@ -379,11 +398,12 @@ LONG WINAPI ExceptionHandlerWithStep(EXCEPTION_POINTERS* pExceptionInfo)
 				::abort();
 			}
 
+			const u8 bitMask = AddrToShadowBitMask(addr);
 			uint8_t* psa = MemToShadow(addr);
-			if (psa[0] > 0)
+			if (IsMemProtected(psa[0], bitMask))
 			{
 				Report("Violation of address write protection %p, resetting protection\n", addr);
-				psa[0] = 0;
+				//psa[0] = ResetMemProtected(psa[0], bitMask);
 			}
 
 			const uptr pageSize = GetPageSizeCached();
@@ -429,33 +449,38 @@ LONG WINAPI ExceptionHandlerWithStep(EXCEPTION_POINTERS* pExceptionInfo)
 	return EXCEPTION_CONTINUE_SEARCH;
 }
 
+
+
 void __declspec(noinline)  ProtectAddress(void* p)
 {
 	uptr addr = (uptr)p;
-	uint8_t* psa = MemToShadow(p);
-	if (psa[0] > 0)   // may trigger shadow memory allocation
+	
+
+	const u8 bitMask = AddrToShadowBitMask(addr);
+	u8* psa = MemToShadow(p);
+
+	if (IsMemProtected(psa[0], bitMask))   // may trigger shadow memory allocation
 		return; // already protected
 
 	const uptr pageSize = GetPageSizeCached();
-	uptr page = RoundDownTo(addr, pageSize);
+	const uptr page = RoundDownTo(addr, pageSize);
 
 	DWORD oldProtect = 0;
-	//RestoreGuard((void*)page);
-	//BOOL res = VirtualProtect((void*)page, pageSize, PAGE_READWRITE | PAGE_GUARD, &oldProtect);
 	BOOL res = VirtualProtect((void*)page, pageSize, PAGE_READONLY, &oldProtect);
 	if (res != 0)
 	{
-		psa[0] = 1;
+		psa[0] = SetMemProtected(psa[0], bitMask);
 	}
 }
 
 void __declspec(noinline)  UnprotectAddress(void* p)
 {
+	const u8 bitMask = AddrToShadowBitMask(p);
 	uint8_t* psa = MemToShadow(p);
-	if (psa[0] == 0)   // may trigger shadow memory allocation
+	if (!IsMemProtected(psa[0], bitMask))   // may trigger shadow memory allocation
 		return; // already un-protected
 
-	psa[0] = 0;
+	psa[0] = ResetMemProtected(psa[0], bitMask);
 
 	// todo: unprotect page
 }
@@ -470,12 +495,30 @@ int main()
 
 	//void* p = VirtualAlloc(nullptr, 4096, MEM_RESERVE, PAGE_READWRITE);
 	void* p = VirtualAlloc(nullptr, 16, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
-	uint64_t* a = reinterpret_cast<uint64_t*>(p);
+	auto* a = reinterpret_cast<uint32_t*>(p);
 	a[0] = 42;
 
 	MEMORY_BASIC_INFORMATION mbi;
 	VirtualQuery(p, &mbi, sizeof(mbi));
 
+	if (kMemBytesInShadowBitScale == 3)
+	{
+		assert(AddrToShadowBitIndex(0ull) == 0);
+		assert(AddrToShadowBitIndex(7) == 0);
+		assert(AddrToShadowBitIndex(8) == 1);
+		assert(AddrToShadowBitIndex(17) == 2);
+		assert(AddrToShadowBitIndex(63) == 7);
+		assert(AddrToShadowBitIndex(65) == 0);
+	}
+	else if (kMemBytesInShadowBitScale == 2)
+	{
+		assert(AddrToShadowBitIndex(0ull) == 0);
+		assert(AddrToShadowBitIndex(3) == 0);
+		assert(AddrToShadowBitIndex(4) == 1);
+		assert(AddrToShadowBitIndex(9) == 2);
+		assert(AddrToShadowBitIndex(31) == 7);
+		assert(AddrToShadowBitIndex(32) == 0);
+	}
 
 	//uint8_t* psa = MemToShadow(p);
 	//psa[0] = 5;
@@ -485,6 +528,12 @@ int main()
 
 	//uint32_t x = a[0];
 	//a[1] = 29;
+
+	for (int i = 0; i < 5; ++i)
+	{
+		::printf("&a[%d] = %p\n", i, a + i);
+	}
+
 
 	a[0] = 0;
 	a[1] = 1;
@@ -500,7 +549,7 @@ int main()
 	a[3] = 13;
 	a[4] = 14;
 
-	ProtectAddress(&a[2]);
+	ProtectAddress(&a[1]);
 
 	a[0] = 20;
 	a[1] = 21;
