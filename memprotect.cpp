@@ -12,6 +12,9 @@
 #define NODISCARD
 #endif
 
+namespace memprotect 
+{
+
 using uptr = uintptr_t;
 using u64 = uint64_t;
 using u32 = uint32_t;
@@ -23,6 +26,8 @@ static const u64 kMemBytesInShadowBitScale = 2; // 2^3=8 bytes, 2^2=4 bytes
 static const u64 kDefaultShadowScale = 3 + kMemBytesInShadowBitScale;
 static const u64 kDefaultShadowSentinel = ~(uptr)0;
 static const u64 kDefaultShadowOffset64 = 1ULL << 44;
+
+static HANDLE g_ExceptionHandlerHandle;
 
 
 uptr __asan_shadow_memory_dynamic_address = kDefaultShadowSentinel;
@@ -200,8 +205,8 @@ static void InitializeHighMemEnd() {
 
 void* MmapFixedNoAccess(uptr fixed_addr, uptr size, const char *name) {
 	(void)name; // unsupported
-	void *res = VirtualAlloc((LPVOID)fixed_addr, size,
-		MEM_RESERVE, PAGE_NOACCESS);
+	//::printf("MmapFixedNoAccess VirtualAlloc %s RESERVE %p %zu", name, (void*)fixed_addr, size);
+	void *res = VirtualAlloc((LPVOID)fixed_addr, size, MEM_RESERVE, PAGE_NOACCESS);
 	if (res == 0)
 		Report("WARNING: failed to mprotect %p (%zd) bytes at %p (error code: %d)\n",
 			size, size, fixed_addr, GetLastError());
@@ -217,6 +222,7 @@ void* MmapFixedNoReserve(uptr fixed_addr, uptr size, const char *name) {
   // On asan/Windows64, use MEM_COMMIT would result in error
   // 1455:ERROR_COMMITMENT_LIMIT.
   // Asan uses exception handler to commit page on demand.
+	//::printf("MmapFixedNoReserve VirtualAlloc %s RESERVE %p %zu\n", name, (void*)fixed_addr, size);
 	void *p = VirtualAlloc((LPVOID)fixed_addr, size, MEM_RESERVE, PAGE_READWRITE);
 #else
 	void *p = VirtualAlloc((LPVOID)fixed_addr, size, MEM_RESERVE | MEM_COMMIT,
@@ -226,6 +232,16 @@ void* MmapFixedNoReserve(uptr fixed_addr, uptr size, const char *name) {
 		Report("ERROR: failed to allocate %p (%zd) bytes at %p (error code: %d)\n",
 			size, size, fixed_addr, GetLastError());
 	return p;
+}
+
+void MmapFixedRelease(uptr addr, uptr size, const char* name)
+{
+	//::printf("MmapFixedRelease VirtualAlloc %s RELEASE %p %zu\n", name, (void*)addr, size);
+	BOOL res = VirtualFree((LPVOID)addr, 0, MEM_RELEASE);
+	if (res == 0)
+	{
+		Report("Failed to release %p (error code: %d)\n", (void*)addr, GetLastError());
+	}
 }
 
 void ReserveShadowMemoryRange(uptr beg, uptr end, const char *name) {
@@ -239,6 +255,12 @@ void ReserveShadowMemoryRange(uptr beg, uptr end, const char *name) {
 			size);
 		::abort();
 	}
+}
+
+void ReleaseShadowMemoryRange(uptr beg, uptr end, const char* name)
+{
+	const uptr size = end - beg + 1;
+	MmapFixedRelease(beg, size, name);
 }
 
 static void ProtectGap(uptr addr, uptr size) {
@@ -347,6 +369,16 @@ void InitializeShadowMemory()
 	}
 }
 
+void ShutdownShadowMemory()
+{
+	ReleaseShadowMemoryRange(kProtectedShadowGapBeg, kProtectedShadowGapBeg + kProtectedShadowGapSize - 1, "shadow gap");
+	ReleaseShadowMemoryRange(kHighShadowBeg, kHighShadowEnd, "high shadow");
+	if (kLowShadowBeg)
+		ReleaseShadowMemoryRange(kLowShadowBeg - GetMmapGranularity(), kLowShadowEnd, "low shadow");
+
+	__asan_shadow_memory_dynamic_address = kDefaultShadowSentinel;
+}
+
 uptr FindDynamicPageInfoStart()
 {
 	uptr granularity = GetMmapGranularity();
@@ -397,6 +429,11 @@ void InitializePageInfoMemory()
 	}
 }
 
+void ShutdownPageInfoMemory()
+{
+	ReleaseShadowMemoryRange(kPageInfoBeg, kPageInfoEnd, "page info");
+	__asan_page_info_memory_dynamic_address = kDefaultShadowSentinel;
+}
 
 static inline bool AddrIsInLowShadow(uptr a) { return a >= kLowShadowBeg && a <= kLowShadowEnd; }
 static inline bool AddrIsInHighShadow(uptr a) { return a >= kHighShadowBeg && a <= kHighMemEnd; }
@@ -523,16 +560,15 @@ LONG WINAPI ExceptionHandlerWithStep(EXCEPTION_POINTERS* pExceptionInfo)
 
 
 
-void __declspec(noinline)  ProtectAddress(void* p)
+bool ProtectAddress(void* p)
 {
 	uptr addr = (uptr)p;
-	
 
 	const u8 bitMask = AddrToShadowBitMask(addr);
 	u8* psa = MemToShadow(p);
 
 	if (IsMemProtected(psa[0], bitMask))   // may trigger shadow memory allocation
-		return; // already protected
+		return true; // already protected
 
 	const uptr pageSize = GetPageSizeCached();
 	const uptr page = RoundDownTo(addr, pageSize);
@@ -552,17 +588,20 @@ void __declspec(noinline)  ProtectAddress(void* p)
 	{
 		psa[0] = SetMemProtected(psa[0], bitMask);
 		*pPageInfo += 1;
+
+		return true;
 	}
+	return false;
 }
 
-void __declspec(noinline)  UnprotectAddress(void* p)
+bool UnprotectAddress(void* p)
 {
 	uptr addr = (uptr)p;
 
 	const u8 bitMask = AddrToShadowBitMask(p);
 	uint8_t* psa = MemToShadow(p);
 	if (!IsMemProtected(psa[0], bitMask))   // may trigger shadow memory allocation
-		return; // already un-protected
+		return true; // already un-protected
 
 	const uptr pageSize = GetPageSizeCached();
 	const uptr page = RoundDownTo(addr, pageSize);
@@ -572,6 +611,7 @@ void __declspec(noinline)  UnprotectAddress(void* p)
 	{
 		Report("PageInfo and shadow info are out of sync");
 		::abort();
+		return false;
 	}
 
 	psa[0] = ResetMemProtected(psa[0], bitMask);
@@ -585,8 +625,11 @@ void __declspec(noinline)  UnprotectAddress(void* p)
 		if (res == 0)
 		{
 			Report("Unable to remove page protection %d", GetLastError()); 
+			return false;
 		}
 	}
+
+	return true;
 }
 
 
@@ -622,87 +665,25 @@ void Tests()
 }
 
 
-int main()
+void Init()
 {
 	InitializeHighMemEnd();
 	InitializeShadowMemory();
 	InitializePageInfoMemory();
-
+	
 	Tests();
 
-	AddVectoredExceptionHandler(TRUE, ExceptionHandlerWithStep);
-
-	//void* p = VirtualAlloc(nullptr, 4096, MEM_RESERVE, PAGE_READWRITE);
-	void* p = VirtualAlloc(nullptr, 16, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
-	auto* a = reinterpret_cast<uint32_t*>(p);
-	a[0] = 42;
-
-	MEMORY_BASIC_INFORMATION mbi;
-	VirtualQuery(p, &mbi, sizeof(mbi));
-
-	
-	
-	
-
-	//uint8_t* psa = MemToShadow(p);
-	//psa[0] = 5;
-
-	//DWORD oldProtect = 0;
-	//BOOL res = VirtualProtect(p, 4096, PAGE_READONLY, &oldProtect);
-
-	//uint32_t x = a[0];
-	//a[1] = 29;
-
-	for (int i = 0; i < 5; ++i)
-	{
-		::printf("&a[%d] = %p\n", i, a + i);
-	}
-
-
-	::printf("------------ stage 0\n");
-	a[0] = 0;
-	a[1] = 1;
-	a[2] = 2;
-	a[3] = 3;
-	a[4] = 4;
-
-	ProtectAddress(&a[3]);
-
-	::printf("------------ stage 1\n");
-	a[0] = 10;
-	a[1] = 11;
-	a[2] = 12;
-	a[3] = 13;
-	a[4] = 14;
-
-	ProtectAddress(&a[1]);
-
-	::printf("------------ stage 2\n");
-	a[0] = 20;
-	a[1] = 21;
-	a[2] = 22;
-	a[3] = 23;
-	a[4] = 24;
-
-	
-	UnprotectAddress(&a[3]);
-
-	::printf("------------ stage 3\n");
-	a[0] = 30;
-	a[1] = 31;
-	a[2] = 32;
-	a[3] = 33;
-	a[4] = 34;
-
-	UnprotectAddress(&a[1]);
-
-	::printf("------------ stage 4\n");
-	a[0] = 40;
-	a[1] = 41;
-	a[2] = 42;
-	a[3] = 43;
-	a[4] = 44;
-
-    std::cout << "Hello World!\n"; 
+	g_ExceptionHandlerHandle = AddVectoredExceptionHandler(TRUE, ExceptionHandlerWithStep);
 }
+
+
+void Shutdown()
+{
+	RemoveVectoredExceptionHandler(g_ExceptionHandlerHandle);
+	ShutdownPageInfoMemory();
+	ShutdownShadowMemory();
+}
+
+
+} // namespace memprotect
 
