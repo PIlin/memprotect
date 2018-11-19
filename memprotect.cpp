@@ -498,6 +498,9 @@ LONG WINAPI ExceptionHandlerWithStep(EXCEPTION_POINTERS* pExceptionInfo)
 		if (op == opWrite)
 		{
 			auto& state = guardProcessingState;
+
+			//::printf("FAULT %p %d tid %d\n", rec.ExceptionAddress, (int)state.state, GetCurrentThreadId());
+
 			if (state.state != SGuardProcessingState::EState::None)
 			{
 				Report("Wrong state to process access violation\n");
@@ -533,6 +536,9 @@ LONG WINAPI ExceptionHandlerWithStep(EXCEPTION_POINTERS* pExceptionInfo)
 	else if (rec.ExceptionCode == EXCEPTION_SINGLE_STEP)
 	{
 		auto& state = guardProcessingState;
+
+		//::printf("STEP  %p %d tid %d\n", rec.ExceptionAddress, (int)state.state, GetCurrentThreadId());
+
 		if (state.state == SGuardProcessingState::EState::TemporaryUnprotected)
 		{
 			void* page = state.page;
