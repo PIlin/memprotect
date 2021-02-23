@@ -1,6 +1,7 @@
 #include <cassert>
 #include <iostream>
 #include <atomic>
+#include <mutex>
 
 #define NOMINMAX
 #define WIN32_LEAN_AND_MEAN
@@ -485,9 +486,13 @@ static inline bool IsMemProtected(u8 shadowByte, u8 bitMask) { return (shadowByt
 NODISCARD static inline u8 SetMemProtected(u8 shadowByte, u8 bitMask) { return (shadowByte | bitMask); }
 NODISCARD static inline u8 ResetMemProtected(u8 shadowByte, u8 bitMask){ return (shadowByte & (~bitMask)); }
 
+static std::mutex s_pageInfoMutex;
 
-NODISCARD NOINLINE static TPageInfo LockPageInfo(TPageInfo* pPageInfo)
+#define PAGE_INFO_LOCK_MODE 0
+
+NODISCARD NOINLINE static TPageInfo LockPageInfo(uptr page)
 {
+	TPageInfo* pPageInfo = PageToPageInfo(page);
 	std::atomic<TPageInfo>* ptr = reinterpret_cast<std::atomic<TPageInfo>*>(pPageInfo);
 
 	TPageInfo expected, locked;
@@ -498,6 +503,7 @@ NODISCARD NOINLINE static TPageInfo LockPageInfo(TPageInfo* pPageInfo)
 	int mask = 1;
 	int const max = 64; //MAX_BACKOFF
 
+#if PAGE_INFO_LOCK_MODE == 0
 	do
 	{
 		while (true)
@@ -516,20 +522,28 @@ NODISCARD NOINLINE static TPageInfo LockPageInfo(TPageInfo* pPageInfo)
 		locked = expected;
 		locked.info.lock = 1;
 	} while (!ptr->compare_exchange_weak(expected, locked, std::memory_order_acquire, std::memory_order_relaxed));
+#elif PAGE_INFO_LOCK_MODE == 1
+	s_pageInfoMutex.lock();
+	locked = ptr->load(std::memory_order_acquire);
+#endif
 
 	return locked;
 }
 
-static void UnlockPageInfo(TPageInfo* pPageInfo, TPageInfo newValue)
+static void UnlockPageInfo(uptr page, TPageInfo newValue)
 {
 	MEM_ASSERT2(newValue.info.lock != 0);
 
+	TPageInfo* pPageInfo = PageToPageInfo(page);
 	std::atomic<TPageInfo>* ptr = reinterpret_cast<std::atomic<TPageInfo>*>(pPageInfo);
 	TPageInfo unlocked = newValue;
 	unlocked.info.lock = 0;
 
 	//ptr->exchange(unlock)
 	ptr->store(unlocked, std::memory_order_release);
+#if PAGE_INFO_LOCK_MODE == 1
+	s_pageInfoMutex.unlock();
+#endif
 }
 
 //struct SLockPageInfoScope
@@ -551,7 +565,7 @@ struct SGuardProcessingState
 {
 	enum class EState { None, TemporaryUnprotected };
 	EState state = EState::None;
-	void* page = nullptr;
+	uptr page = 0;
 	TPageInfo pi;
 };
 
@@ -599,8 +613,8 @@ LONG WINAPI ExceptionHandlerWithStep(EXCEPTION_POINTERS* pExceptionInfo)
 			const uptr pageSize = GetPageSizeCached();
 			const uptr page = RoundDownTo(addr, pageSize);
 
-			TPageInfo* pPageInfo = PageToPageInfo(page);
-			TPageInfo pi = LockPageInfo(pPageInfo);
+			
+			TPageInfo pi = LockPageInfo(page);
 
 			DWORD oldProtect = 0;
 			//::printf("-- temp remove protect on page %p\n", (void*)page);
@@ -614,7 +628,7 @@ LONG WINAPI ExceptionHandlerWithStep(EXCEPTION_POINTERS* pExceptionInfo)
 
 			pExceptionInfo->ContextRecord->EFlags |= 0x100;
 			state.state = SGuardProcessingState::EState::TemporaryUnprotected;
-			state.page = (void*)page;
+			state.page = page;
 			state.pi = pi;
 			return EXCEPTION_CONTINUE_EXECUTION;
 		}
@@ -627,17 +641,17 @@ LONG WINAPI ExceptionHandlerWithStep(EXCEPTION_POINTERS* pExceptionInfo)
 
 		if (state.state == SGuardProcessingState::EState::TemporaryUnprotected)
 		{
-			void* page = state.page;
+			uptr page = state.page;
 			TPageInfo pi = state.pi;
 
 			state.state = SGuardProcessingState::EState::None;
-			state.page = nullptr;
+			state.page = 0;
 
 			
 			const uptr pageSize = GetPageSizeCached();
 			DWORD oldProtect = 0;
 			//::printf("-- restore protect on page %p\n", (void*)page);
-			const BOOL res = VirtualProtect(page, pageSize, PAGE_READONLY, &oldProtect);
+			const BOOL res = VirtualProtect((void*)page, pageSize, PAGE_READONLY, &oldProtect);
 			MEM_ASSERT(oldProtect == PAGE_READWRITE);
 			if (res == 0)
 			{
@@ -645,8 +659,7 @@ LONG WINAPI ExceptionHandlerWithStep(EXCEPTION_POINTERS* pExceptionInfo)
 				::abort();
 			}
 
-			TPageInfo* pPageInfo = PageToPageInfo(page);
-			UnlockPageInfo(pPageInfo, pi);
+			UnlockPageInfo(page, pi);
 
 			return EXCEPTION_CONTINUE_EXECUTION;
 		}
@@ -670,9 +683,7 @@ bool ProtectAddress(void* p)
 	const uptr pageSize = GetPageSizeCached();
 	const uptr page = RoundDownTo(addr, pageSize);
 
-	TPageInfo* pPageInfo = PageToPageInfo(page);
-	
-	TPageInfo pi = LockPageInfo(pPageInfo);
+	TPageInfo pi = LockPageInfo(page);
 
 	bool isPageProtected = (pi.info.counter != 0);
 	if (!isPageProtected)
@@ -693,7 +704,7 @@ bool ProtectAddress(void* p)
 		result = true;
 	}
 
-	UnlockPageInfo(pPageInfo, pi);
+	UnlockPageInfo(page, pi);
 
 	return result;
 }
@@ -709,9 +720,8 @@ bool UnprotectAddress(void* p)
 
 	const uptr pageSize = GetPageSizeCached();
 	const uptr page = RoundDownTo(addr, pageSize);
-	TPageInfo* pPageInfo = PageToPageInfo(page);
 
-	TPageInfo pi = LockPageInfo(pPageInfo);
+	TPageInfo pi = LockPageInfo(page);
 
 	bool isPageProtected = (pi.info.counter != 0);
 	if (!isPageProtected)
@@ -737,7 +747,7 @@ bool UnprotectAddress(void* p)
 		}
 	}
 
-	UnlockPageInfo(pPageInfo, pi);
+	UnlockPageInfo(page, pi);
 
 	return result;
 }
