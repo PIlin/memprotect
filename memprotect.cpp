@@ -15,6 +15,10 @@
 
 #define NOINLINE __declspec(noinline)
 
+//#define MEM_ASSERT(cond) assert(cond)
+#define MEM_ASSERT(cond) if (!(cond)) __debugbreak();
+#define MEM_ASSERT2(cond) assert(cond)
+
 namespace memprotect 
 {
 
@@ -428,7 +432,7 @@ void InitializePageInfoMemory()
 
 	PrintAddressSpacePageInfoLayout();
 
-	assert(pageinfo_start == kPageInfoBeg);
+	MEM_ASSERT(pageinfo_start == kPageInfoBeg);
 
 	if (fullRangeIsAvailable) 
 	{
@@ -518,7 +522,7 @@ NODISCARD NOINLINE static TPageInfo LockPageInfo(TPageInfo* pPageInfo)
 
 static void UnlockPageInfo(TPageInfo* pPageInfo, TPageInfo newValue)
 {
-	assert(newValue.info.lock != 0);
+	MEM_ASSERT2(newValue.info.lock != 0);
 
 	std::atomic<TPageInfo>* ptr = reinterpret_cast<std::atomic<TPageInfo>*>(pPageInfo);
 	TPageInfo unlocked = newValue;
@@ -601,7 +605,7 @@ LONG WINAPI ExceptionHandlerWithStep(EXCEPTION_POINTERS* pExceptionInfo)
 			DWORD oldProtect = 0;
 			//::printf("-- temp remove protect on page %p\n", (void*)page);
 			const BOOL res = VirtualProtect((void*)page, pageSize, PAGE_READWRITE, &oldProtect);
-			assert(oldProtect == PAGE_READONLY);
+			MEM_ASSERT(oldProtect == PAGE_READONLY);
 			if (res == 0)
 			{
 				Report("Unable to remove protection from page %p for address %p: err %d\n", page, addr, GetLastError());
@@ -634,7 +638,7 @@ LONG WINAPI ExceptionHandlerWithStep(EXCEPTION_POINTERS* pExceptionInfo)
 			DWORD oldProtect = 0;
 			//::printf("-- restore protect on page %p\n", (void*)page);
 			const BOOL res = VirtualProtect(page, pageSize, PAGE_READONLY, &oldProtect);
-			assert(oldProtect == PAGE_READWRITE);
+			MEM_ASSERT(oldProtect == PAGE_READWRITE);
 			if (res == 0)
 			{
 				Report("Unable to set protection back to page %p\n", page);
@@ -725,7 +729,7 @@ bool UnprotectAddress(void* p)
 	{
 		DWORD oldProtect = 0;
 		BOOL res = VirtualProtect((void*)page, pageSize, PAGE_READWRITE, &oldProtect);
-		assert(oldProtect == PAGE_READONLY);
+		MEM_ASSERT(oldProtect == PAGE_READONLY);
 		if (res == 0)
 		{
 			Report("Unable to remove page protection %d", GetLastError()); 
