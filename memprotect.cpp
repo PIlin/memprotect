@@ -1,5 +1,6 @@
 #include <cassert>
 #include <iostream>
+#include <atomic>
 
 #define NOMINMAX
 #define WIN32_LEAN_AND_MEAN
@@ -11,6 +12,8 @@
 #else
 #define NODISCARD
 #endif
+
+#define NOINLINE __declspec(noinline)
 
 namespace memprotect 
 {
@@ -79,7 +82,20 @@ uptr RoundDownTo(uptr x, uptr boundary) {
 	return x & ~(boundary - 1);
 }
 
-using TPageInfo = u16;
+union TPageInfo
+{
+	using Base = u16;
+	struct SInfo
+	{
+		Base counter : 15;
+		Base lock : 1;
+	};
+
+	SInfo info;
+	Base data;
+};
+
+//using TPageInfo = u16;
 static const u64 kPageInfoRecordSize = sizeof(TPageInfo);
 uptr kPageInfoScale = kDefaultShadowSentinel;
 uptr __asan_page_info_memory_dynamic_address = kDefaultShadowSentinel;
@@ -466,11 +482,73 @@ NODISCARD static inline u8 SetMemProtected(u8 shadowByte, u8 bitMask) { return (
 NODISCARD static inline u8 ResetMemProtected(u8 shadowByte, u8 bitMask){ return (shadowByte & (~bitMask)); }
 
 
+NODISCARD NOINLINE static TPageInfo LockPageInfo(TPageInfo* pPageInfo)
+{
+	std::atomic<TPageInfo>* ptr = reinterpret_cast<std::atomic<TPageInfo>*>(pPageInfo);
+
+	TPageInfo expected, locked;
+
+	// https://software.intel.com/sites/default/files/managed/9e/bc/64-ia-32-architectures-optimization-manual.pdf
+	// Example 2-4.  Contended Locks with Increasing Back-off Example
+
+	int mask = 1;
+	int const max = 64; //MAX_BACKOFF
+
+	do
+	{
+		while (true)
+		{
+			expected = ptr->load(std::memory_order_relaxed);
+			if (expected.info.lock == 0)
+				break;
+
+			for (int i = mask; i; --i)
+			{
+				_mm_pause();
+			}
+			mask = mask < max ? mask << 1 : max;    // mask <<= 1  up to a max
+		}
+
+		locked = expected;
+		locked.info.lock = 1;
+	} while (!ptr->compare_exchange_weak(expected, locked, std::memory_order_acquire, std::memory_order_relaxed));
+
+	return locked;
+}
+
+static void UnlockPageInfo(TPageInfo* pPageInfo, TPageInfo newValue)
+{
+	assert(newValue.info.lock != 0);
+
+	std::atomic<TPageInfo>* ptr = reinterpret_cast<std::atomic<TPageInfo>*>(pPageInfo);
+	TPageInfo unlocked = newValue;
+	unlocked.info.lock = 0;
+
+	//ptr->exchange(unlock)
+	ptr->store(unlocked, std::memory_order_release);
+}
+
+//struct SLockPageInfoScope
+//{
+//	TPageInfo* pPageInfo;
+//	SLockPageInfoScope(TPageInfo* pPageInfo)
+//		: pPageInfo(pPageInfo)
+//	{
+//		LockPageInfo(pPageInfo);
+//	}
+//
+//	~SLockPageInfoScope()
+//	{
+//		UnlockPageInfo(pPageInfo);
+//	}
+//};
+
 struct SGuardProcessingState
 {
 	enum class EState { None, TemporaryUnprotected };
 	EState state = EState::None;
 	void* page = nullptr;
+	TPageInfo pi;
 };
 
 static thread_local SGuardProcessingState guardProcessingState;
@@ -511,11 +589,14 @@ LONG WINAPI ExceptionHandlerWithStep(EXCEPTION_POINTERS* pExceptionInfo)
 			uint8_t* psa = MemToShadow(addr);
 			if (IsMemProtected(psa[0], bitMask))
 			{
-				Report("Violation of address write protection %p, ecxeption addr %p\n", addr, rec.ExceptionAddress);
+				//Report("Violation of address write protection %p, ecxeption addr %p\n", addr, rec.ExceptionAddress);
 			}
 
 			const uptr pageSize = GetPageSizeCached();
 			const uptr page = RoundDownTo(addr, pageSize);
+
+			TPageInfo* pPageInfo = PageToPageInfo(page);
+			TPageInfo pi = LockPageInfo(pPageInfo);
 
 			DWORD oldProtect = 0;
 			//::printf("-- temp remove protect on page %p\n", (void*)page);
@@ -530,6 +611,7 @@ LONG WINAPI ExceptionHandlerWithStep(EXCEPTION_POINTERS* pExceptionInfo)
 			pExceptionInfo->ContextRecord->EFlags |= 0x100;
 			state.state = SGuardProcessingState::EState::TemporaryUnprotected;
 			state.page = (void*)page;
+			state.pi = pi;
 			return EXCEPTION_CONTINUE_EXECUTION;
 		}
 	}
@@ -542,6 +624,7 @@ LONG WINAPI ExceptionHandlerWithStep(EXCEPTION_POINTERS* pExceptionInfo)
 		if (state.state == SGuardProcessingState::EState::TemporaryUnprotected)
 		{
 			void* page = state.page;
+			TPageInfo pi = state.pi;
 
 			state.state = SGuardProcessingState::EState::None;
 			state.page = nullptr;
@@ -557,6 +640,10 @@ LONG WINAPI ExceptionHandlerWithStep(EXCEPTION_POINTERS* pExceptionInfo)
 				Report("Unable to set protection back to page %p\n", page);
 				::abort();
 			}
+
+			TPageInfo* pPageInfo = PageToPageInfo(page);
+			UnlockPageInfo(pPageInfo, pi);
+
 			return EXCEPTION_CONTINUE_EXECUTION;
 		}
 	}
@@ -580,7 +667,10 @@ bool ProtectAddress(void* p)
 	const uptr page = RoundDownTo(addr, pageSize);
 
 	TPageInfo* pPageInfo = PageToPageInfo(page);
-	bool isPageProtected = (*pPageInfo != 0);
+	
+	TPageInfo pi = LockPageInfo(pPageInfo);
+
+	bool isPageProtected = (pi.info.counter != 0);
 	if (!isPageProtected)
 	{
 		DWORD oldProtect = 0;
@@ -590,14 +680,18 @@ bool ProtectAddress(void* p)
 			isPageProtected = true;
 		}
 	}
+	bool result = false;
 	if (isPageProtected)
 	{
 		psa[0] = SetMemProtected(psa[0], bitMask);
-		*pPageInfo += 1;
+		pi.info.counter += 1;
 
-		return true;
+		result = true;
 	}
-	return false;
+
+	UnlockPageInfo(pPageInfo, pi);
+
+	return result;
 }
 
 bool UnprotectAddress(void* p)
@@ -612,7 +706,10 @@ bool UnprotectAddress(void* p)
 	const uptr pageSize = GetPageSizeCached();
 	const uptr page = RoundDownTo(addr, pageSize);
 	TPageInfo* pPageInfo = PageToPageInfo(page);
-	bool isPageProtected = (*pPageInfo != 0);
+
+	TPageInfo pi = LockPageInfo(pPageInfo);
+
+	bool isPageProtected = (pi.info.counter != 0);
 	if (!isPageProtected)
 	{
 		Report("PageInfo and shadow info are out of sync");
@@ -621,9 +718,10 @@ bool UnprotectAddress(void* p)
 	}
 
 	psa[0] = ResetMemProtected(psa[0], bitMask);
-	*pPageInfo -= 1;
+	pi.info.counter -= 1;
 
-	if (*pPageInfo == 0)
+	bool result = true;
+	if (pi.info.counter == 0)
 	{
 		DWORD oldProtect = 0;
 		BOOL res = VirtualProtect((void*)page, pageSize, PAGE_READWRITE, &oldProtect);
@@ -631,11 +729,13 @@ bool UnprotectAddress(void* p)
 		if (res == 0)
 		{
 			Report("Unable to remove page protection %d", GetLastError()); 
-			return false;
+			result = false;
 		}
 	}
 
-	return true;
+	UnlockPageInfo(pPageInfo, pi);
+
+	return result;
 }
 
 
